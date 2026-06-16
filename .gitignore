@@ -5,6 +5,9 @@ out/
 # the video walkthrough (personal notes for recording)
 VIDEO_SCRIPT.md
 
+# agent handoff notes (local only)
+CLAUDE.md
+
 # python
 __pycache__/
 *.pyc
