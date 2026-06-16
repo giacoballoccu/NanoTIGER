@@ -109,6 +109,17 @@ IDs, "predict the next token" *is* "predict the next item." At eval time
 (`eval.py`) a constrained beam search generates the next item's digits and maps
 them back to a real item.
 
+## notebooks
+
+Two short, didactic notebooks (synthetic data, runs in seconds, no gated model
+needed) that open up the two core ideas:
+
+- `notebooks/01_semantic_ids.ipynb` — train the RQ-VAE, watch the loss fall, and
+  *see* that items sharing a first code occupy the same region of embedding space.
+- `notebooks/02_recgpt.ipynb` — tokenize histories, train RecGPT, and generate the
+  next item: a history inside one cluster yields next-item predictions in the
+  same cluster.
+
 ## file guide
 
 | file | what it is |
