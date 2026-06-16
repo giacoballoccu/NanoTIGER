@@ -1,0 +1,12 @@
+# Core
+torch>=2.0
+numpy>=1.24
+
+# Stage 1: dataset
+datasets>=2.18
+
+# Stage 2: EmbeddingGemma (Matryoshka). EmbeddingGemma needs recent versions.
+sentence-transformers>=5.0
+transformers>=4.56
+
+# Stages 3-5 (RQ-VAE + RecGPT) use only torch + numpy.
