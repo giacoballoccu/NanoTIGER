@@ -1,5 +1,7 @@
 # nanoTIGER
 
+<img width="1365" height="716" alt="Gemini_Generated_Image_s1w5dis1w5dis1w5" src="https://github.com/user-attachments/assets/bfc4e706-cf11-4739-a4a0-300715500abd" />
+
 The simplest, fastest repository for understanding **Semantic IDs** and
 **generative recommendation**. In the spirit of
 [nanoGPT](https://github.com/karpathy/nanoGPT): a handful of flat, hackable
