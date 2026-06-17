@@ -67,54 +67,57 @@ def recall_ndcg(ranked, target, k):
     return 0.0, 0.0
 
 
+def evaluate(model, tok, sequences, pop_ranked, device, ks=None, beam=None,
+             split="test"):
+    """Average Recall@k and NDCG@k (and a popularity baseline) over users on a
+    temporal split. split='test' -> predict seq[-1] from seq[:-1];
+    split='val' -> predict seq[-2] from seq[:-2]. Returns dict:
+        {k: {'recall':_, 'ndcg':_, 'pop_recall':_, 'pop_ndcg':_}}.
+    """
+    ks = ks or cfg.eval_ks
+    beam = beam or cfg.beam_size
+    cut, tgt = (-1, -1) if split == "test" else (-2, -2)
+    agg = {k: [0.0, 0.0, 0.0, 0.0] for k in ks}
+    users = [s for s in sequences if len(s) >= 3]
+    for seq in users:
+        history, target = seq[:cut], seq[tgt]
+        ranked = beam_search_items(model, tok, history, device, beam, max(ks))
+        pop_rank = [i for i in pop_ranked if i not in set(history)]
+        for k in ks:
+            r, g = recall_ndcg(ranked, target, k)
+            pr, pg = recall_ndcg(pop_rank, target, k)
+            agg[k][0] += r; agg[k][1] += g; agg[k][2] += pr; agg[k][3] += pg
+    n = max(1, len(users))
+    return {k: {"recall": v[0] / n, "ndcg": v[1] / n,
+                "pop_recall": v[2] / n, "pop_ndcg": v[3] / n} for k, v in agg.items()}
+
+
 def main():
     seed_everything(cfg.seed)
     device = get_device()
 
     sequences = load_json(DATA / "sequences.json")["train"]
-    sem = load_json(DATA / "semantic_ids.json")
-    tok = build_tokenizer(sem["ids"])
+    tok = build_tokenizer(load_json(DATA / "semantic_ids.json")["ids"])
 
     ckpt = torch.load(OUT / "recgpt.pt", map_location=device, weights_only=False)
-    gptcfg = GPTConfig(**ckpt["gptcfg"])
-    model = RecGPT(gptcfg).to(device)
+    model = RecGPT(GPTConfig(**ckpt["gptcfg"])).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    # popularity baseline: rank items by training-history frequency
-    pop = Counter(i for s in sequences for i in s[:-1])
-    pop_ranked = [i for i, _ in pop.most_common()]
+    # popularity baseline ranks items by frequency in the training portion only
+    pop_ranked = [i for i, _ in Counter(i for s in sequences for i in s[:-2]).most_common()]
 
-    ks = cfg.eval_ks
-    maxk = max(ks)
-    agg = {k: [0.0, 0.0] for k in ks}            # RecGPT: [recall_sum, ndcg_sum]
-    pop_agg = {k: [0.0, 0.0] for k in ks}
-    n_eval = 0
+    print(f"[eval] scoring {sum(len(s) >= 3 for s in sequences):,} users (temporal split) ...")
+    val = evaluate(model, tok, sequences, pop_ranked, device, split="val")
+    test = evaluate(model, tok, sequences, pop_ranked, device, split="test")
 
-    eval_users = [s for s in sequences if len(s) >= 2]
-    print(f"[eval] scoring {len(eval_users):,} users (leave-one-out) ...")
-    for n, seq in enumerate(eval_users):
-        history, target = seq[:-1], seq[-1]
-        ranked = beam_search_items(model, tok, history, device, cfg.beam_size, maxk)
-        # baseline ranking with seen items removed
-        seen = set(history)
-        pop_rank = [i for i in pop_ranked if i not in seen]
-        for k in ks:
-            r, g = recall_ndcg(ranked, target, k)
-            agg[k][0] += r
-            agg[k][1] += g
-            pr, pg = recall_ndcg(pop_rank, target, k)
-            pop_agg[k][0] += pr
-            pop_agg[k][1] += pg
-        n_eval += 1
-        if (n + 1) % 200 == 0:
-            print(f"  {n + 1}/{len(eval_users)} users ...")
-
-    print(f"\n=== Results over {n_eval:,} users ===")
-    print(f"{'metric':<12}{'RecGPT':>12}{'Popularity':>14}")
-    for k in ks:
-        print(f"Recall@{k:<6}{agg[k][0]/n_eval:>12.4f}{pop_agg[k][0]/n_eval:>14.4f}")
-        print(f"NDCG@{k:<8}{agg[k][1]/n_eval:>12.4f}{pop_agg[k][1]/n_eval:>14.4f}")
+    print(f"\n=== Results (temporal split) ===")
+    print(f"{'metric':<12}{'val':>10}{'test':>10}{'test (pop)':>14}")
+    for k in cfg.eval_ks:
+        print(f"Recall@{k:<5}{val[k]['recall']:>10.4f}{test[k]['recall']:>10.4f}"
+              f"{test[k]['pop_recall']:>14.4f}")
+        print(f"NDCG@{k:<7}{val[k]['ndcg']:>10.4f}{test[k]['ndcg']:>10.4f}"
+              f"{test[k]['pop_ndcg']:>14.4f}")
 
 
 if __name__ == "__main__":

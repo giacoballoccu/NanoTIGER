@@ -1,6 +1,13 @@
 # Core
-torch>=2.0
+torch>=2.0          # on Apple Silicon use an arm64 build (MPS GPU); a CPU-only or
+                    # x86/Rosetta torch reports mps.is_available()==False -> runs on CPU
 numpy>=1.24
+
+# Notebooks: matplotlib + a Jupyter kernel whose torch has MPS.
+# Register the kernel from an MPS-capable interpreter, then select "nanoTIGER (mps)":
+#   python -m ipykernel install --user --name nanotiger --display-name "nanoTIGER (mps)"
+matplotlib>=3.5
+ipykernel>=6.0
 
 # Stage 1: dataset
 datasets>=2.18

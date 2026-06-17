@@ -81,6 +81,21 @@ class VectorQuantizer(nn.Module):
         self.embedding.weight.data.copy_(centroids)
         self._initialized = True
 
+    @torch.no_grad()
+    def revive_dead_codes(self, residual: torch.Tensor) -> int:
+        """Random restart: any codeword no item currently maps to is moved on top
+        of a real residual. This is the standard cure for codebook collapse --
+        without it most codes die and the Semantic IDs lose resolution."""
+        used = torch.unique(torch.cdist(residual, self.embedding.weight).argmin(1))
+        k = self.embedding.weight.shape[0]
+        dead = torch.ones(k, dtype=torch.bool, device=residual.device)
+        dead[used] = False
+        n_dead = int(dead.sum())
+        if n_dead and residual.shape[0]:
+            pick = torch.randint(0, residual.shape[0], (n_dead,), device=residual.device)
+            self.embedding.weight.data[dead] = residual[pick]
+        return n_dead
+
     def forward(self, r: torch.Tensor):
         # nearest codeword by Euclidean distance
         dist = torch.cdist(r, self.embedding.weight)      # (B, K)
@@ -163,46 +178,84 @@ def disambiguate(codes: np.ndarray) -> np.ndarray:
     return np.concatenate([codes, extra], axis=1)
 
 
+@torch.no_grad()
+def recon_loss(model, x):
+    """Mean reconstruction loss on a set of items (no grad)."""
+    was_training = model.training
+    model.eval()
+    _, _, recon, _ = model(x)
+    if was_training:
+        model.train()
+    return recon.item()
+
+
 def main():
     seed_everything(cfg.seed)
     device = get_device()
 
     emb = np.load(DATA / "item_emb.npy")
-    x = torch.from_numpy(emb).float().to(device)
-    print(f"[rqvae] {x.shape[0]:,} item embeddings, dim {x.shape[1]}")
+    x_all = torch.from_numpy(emb).float().to(device)
+    n_all = x_all.shape[0]
+
+    # Item-level train/val split. RQ-VAE "overfitting" = it reconstructs the
+    # items it trained on but not held-out ones, so we watch the gap between
+    # train and val reconstruction.
+    perm = torch.randperm(n_all, device=device)
+    n_val = max(1, int(cfg.rq_val_frac * n_all))
+    val_idx, tr_idx = perm[:n_val], perm[n_val:]
+    x_tr, x_val = x_all[tr_idx], x_all[val_idx]
+    print(f"[rqvae] {n_all:,} items (train {len(tr_idx):,} / val {len(val_idx):,}), "
+          f"dim {x_all.shape[1]}")
 
     model = RQVAE(cfg).to(device)
     print(f"[rqvae] {count_params(model):,} params | "
           f"{cfg.rq_levels} levels x {cfg.rq_codebook_size} codes")
 
-    # k-means init each codebook on the residuals it will actually see
+    # k-means init each codebook on the (train) residuals it will actually see
     with torch.no_grad():
-        z = model.encoder(x)
-        residual = z
+        residual = model.encoder(x_tr)
         for vq in model.quantizers:
             vq.kmeans_init(residual)
             q, _, _, _ = vq(residual)
             residual = residual - q
 
-    opt = torch.optim.Adam(model.parameters(), lr=cfg.rq_lr)
-    n = x.shape[0]
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.rq_lr,
+                           weight_decay=cfg.rq_weight_decay)
+    n = x_tr.shape[0]
     for epoch in range(cfg.rq_epochs):
-        perm = torch.randperm(n, device=device)
+        # periodically restart dead codes (only while the codebook still settles)
+        if epoch and epoch % cfg.rq_revive_every == 0 and epoch < 0.8 * cfg.rq_epochs:
+            with torch.no_grad():
+                residual = model.encoder(x_tr)
+                for vq in model.quantizers:
+                    vq.revive_dead_codes(residual)
+                    q, _, _, _ = vq(residual)
+                    residual = residual - q
+        idx = torch.randperm(n, device=device)
         total_recon = total_vq = 0.0
         for s in range(0, n, cfg.rq_batch_size):
-            batch = x[perm[s:s + cfg.rq_batch_size]]
+            batch = x_tr[idx[s:s + cfg.rq_batch_size]]
             _, _, recon, vq_loss = model(batch)
-            loss = recon + vq_loss
-            opt.zero_grad()
-            loss.backward()
+            (recon + vq_loss).backward()
             opt.step()
+            opt.zero_grad()
             total_recon += recon.item() * len(batch)
             total_vq += float(vq_loss) * len(batch)
         if epoch % 20 == 0 or epoch == cfg.rq_epochs - 1:
-            print(f"  epoch {epoch:3d} | recon {total_recon / n:.4f} | vq {total_vq / n:.4f}")
+            print(f"  epoch {epoch:3d} | train recon {total_recon / n:.4f} | "
+                  f"val recon {recon_loss(model, x_val):.4f} | vq {total_vq / n:.4f}")
 
     # produce Semantic IDs for every item
-    codes = model.encode_ids(x).cpu().numpy()
+    codes = model.encode_ids(x_all).cpu().numpy()
+
+    # --- health checks -----------------------------------------------------
+    tr_r, val_r = recon_loss(model, x_tr), recon_loss(model, x_val)
+    print(f"[rqvae] reconstruction: train {tr_r:.4f} | val {val_r:.4f} | "
+          f"gap {val_r - tr_r:+.4f}  (small gap = not overfitting)")
+    for l in range(cfg.rq_levels):
+        used = len(np.unique(codes[:, l]))
+        print(f"[rqvae] codebook {l}: {used:>3}/{cfg.rq_codebook_size} codes used "
+              f"({100 * used / cfg.rq_codebook_size:.0f}%)")
     n_unique = len({tuple(r) for r in codes})
     print(f"[rqvae] {n_unique:,}/{len(codes):,} unique code tuples "
           f"({100 * n_unique / len(codes):.1f}% before disambiguation)")
@@ -216,7 +269,8 @@ def main():
         },
         DATA / "semantic_ids.json",
     )
-    torch.save(model.state_dict(), OUT / "rqvae.pt")
+    from checkpoints import save_rqvae
+    save_rqvae(model, cfg, OUT / "rqvae.pt")
     print(f"[rqvae] saved data/semantic_ids.json and out/rqvae.pt")
     print("Next: python train.py")
 

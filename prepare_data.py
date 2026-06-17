@@ -126,8 +126,36 @@ def build_sequences(edges, max_seq_len):
     return sequences, user_ids, item2id
 
 
+# how many characters of the description to keep (clipped so the embedding
+# focuses on the item, not a wall of marketing copy)
+DESC_CLIP = 512
+
+
+def build_item_text(row) -> str:
+    """One tagged string per item: name + brand + categories + clipped
+    description. The explicit tags give the embedding model clean structure:
+
+        <item_name> ... </item_name> <store> ... </store>
+        <categories> a > b </categories> <description> ... </description>
+    """
+    name = str(row.get("title") or "").strip()
+    store = str(row.get("store") or "").strip()
+    cats = " > ".join(map(str, row.get("categories") or []))
+    desc = " ".join(map(str, (row.get("features") or []) + (row.get("description") or [])))
+    desc = " ".join(desc.split())[:DESC_CLIP]   # collapse whitespace, then clip
+
+    parts = [f"<item_name> {name} </item_name>"]
+    if store:
+        parts.append(f"<store> {store} </store>")
+    if cats:
+        parts.append(f"<categories> {cats} </categories>")
+    if desc:
+        parts.append(f"<description> {desc} </description>")
+    return " ".join(parts)
+
+
 def fetch_item_text(category, asins):
-    """Stream item metadata and assemble one text blob per kept item."""
+    """Stream item metadata and assemble one tagged text blob per kept item."""
     want = set(asins)
     text = {}
     ds = _load_stream(f"raw_meta_{category}")
@@ -135,64 +163,68 @@ def fetch_item_text(category, asins):
         asin = row.get("parent_asin")
         if asin not in want or asin in text:
             continue
-        parts = []
-        if row.get("title"):
-            parts.append(str(row["title"]))
-        if row.get("store"):
-            parts.append(f"Brand: {row['store']}")
-        cats = row.get("categories") or []
-        if cats:
-            parts.append("Categories: " + " > ".join(map(str, cats)))
-        feats = row.get("features") or []
-        if feats:
-            parts.append(" ".join(map(str, feats)))
-        desc = row.get("description") or []
-        if desc:
-            parts.append(" ".join(map(str, desc)))
-        text[asin] = " | ".join(parts).strip()
+        text[asin] = build_item_text(row)
         if len(text) == len(want):
             break
     # any item without metadata falls back to its asin so nothing is empty
     for a in want:
-        text.setdefault(a, a)
+        text.setdefault(a, f"<item_name> {a} </item_name>")
     return text
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--category", default=cfg.category)
+    ap.add_argument("--categories", nargs="+", default=list(cfg.categories))
     ap.add_argument("--max-reviews", type=int, default=DEFAULT_MAX_REVIEWS)
     args = ap.parse_args()
 
     seed_everything(cfg.seed)
-    print(f"[1/5] streaming up to {args.max_reviews:,} reviews from '{args.category}' ...")
-    interactions = list(stream_interactions(args.category, args.max_reviews))
-    print(f"      got {len(interactions):,} raw interactions")
+    per_cat = max(1, args.max_reviews // len(args.categories))
+    print(f"[1/5] streaming reviews from {len(args.categories)} categories "
+          f"(<= {per_cat:,} each) ...")
+    interactions, asin_cat = [], {}
+    for c in args.categories:
+        got = 0
+        for u, i, ts in stream_interactions(c, per_cat):
+            interactions.append((u, i, ts))
+            asin_cat[i] = c
+            got += 1
+        print(f"      {c}: {got:,} interactions")
+    print(f"      total {len(interactions):,} raw interactions")
 
     print(f"[2/5] {cfg.k_core}-core filtering (min user history {cfg.min_seq_len}) ...")
     edges = k_core_filter(interactions, cfg.k_core, cfg.min_seq_len, cfg.max_items)
     print(f"      {len(edges):,} interactions survive")
 
-    print("[3/5] building per-user sequences ...")
+    # sequences stay sorted by timestamp -> train.py / eval.py take the last item
+    # as the test target and the one before it as validation (a temporal split).
+    print("[3/5] building per-user time-ordered sequences ...")
     sequences, user_ids, item2id = build_sequences(edges, cfg.max_seq_len)
     id2asin = {v: k for k, v in item2id.items()}
     print(f"      {len(sequences):,} users, {len(item2id):,} items")
 
-    print("[4/5] fetching item metadata text ...")
-    text_by_asin = fetch_item_text(args.category, list(item2id.keys()))
+    print("[4/5] fetching item metadata text (per category) ...")
+    by_cat = defaultdict(list)
+    for asin in item2id:
+        by_cat[asin_cat.get(asin)].append(asin)
+    text_by_asin = {}
+    for c, asins in by_cat.items():
+        text_by_asin.update(fetch_item_text(c, asins))
 
     print("[5/5] writing artifacts ...")
     with open(DATA / "items.jsonl", "w") as f:
         for iid in range(len(item2id)):
             asin = id2asin[iid]
-            rec = {"item": iid, "asin": asin, "text": text_by_asin.get(asin, asin)}
+            rec = {"item": iid, "asin": asin,
+                   "text": text_by_asin.get(asin, asin),
+                   "category": asin_cat.get(asin)}
             f.write(json.dumps(rec) + "\n")
     save_json({"train": sequences, "user_ids": user_ids}, DATA / "sequences.json")
     save_json(
         {
             "n_items": len(item2id),
             "n_users": len(sequences),
-            "category": args.category,
+            "categories": args.categories,
             "k_core": cfg.k_core,
         },
         DATA / "meta.json",

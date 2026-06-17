@@ -68,11 +68,18 @@ related:
 python show_neighbors.py
 ```
 
-Everything is steered from a single small dataclass in `config.py`. Want a
-different catalog? Change one line (`All_Beauty` is the smallest Amazon category):
+Or reproduce the full multi-domain results (codebook health, per-category
+Recall/NDCG, joint-vs-specialized ablation) on the offline demo catalog:
 
 ```bash
-bash run.sh --category All_Beauty
+python experiments.py
+```
+
+Everything is steered from a single small dataclass in `config.py`. Want
+different catalogs? Edit `categories` (e.g. `["All_Beauty"]`, the smallest):
+
+```bash
+bash run.sh --categories All_Beauty
 ```
 
 ## I only have a macbook
@@ -111,10 +118,66 @@ IDs, "predict the next token" *is* "predict the next item." At eval time
 (`eval.py`) a constrained beam search generates the next item's digits and maps
 them back to a real item.
 
+## results
+
+The repo ships a fully **offline, reproducible** demo so you can see everything
+work without the gated EmbeddingGemma download: a synthetic **6-domain** catalog
+(Musical Instruments, Video Games, Office Products, Home & Kitchen, Sports &
+Outdoors, Pet Supplies) with brand-coherent user histories. One command trains
+the codebook + recommender and prints every number below:
+
+```bash
+python experiments.py
+```
+
+Swap in real Amazon data by running `prepare_data.py` + `embed_items.py` first —
+nothing else changes. *(The numbers below are from the synthetic demo, so read
+them as evidence the machinery works and behaves sensibly, not as an Amazon
+benchmark.)*
+
+**The codebook is solid.** RQ-VAE on 3,600 items, held-out item split:
+
+| reconstruction (train / val) | codebook used (levels 0/1/2) | unique IDs before disambiguation |
+|---|---|---|
+| 0.0001 / 0.0001 (no overfit) | 89% / 93% / 60% | 94.4% |
+
+…and the top code is **pure per domain** — every first-code group holds items
+from a single domain.
+
+**Generative recommendation, per category** — temporal leave-one-out (predict
+the last item; R@1 = next-item hit rate), 9,000 users, one joint model:
+
+| Domain | R@1 | R@5 | R@10 | NDCG@5 | NDCG@10 |
+|---|---|---|---|---|---|
+| Musical Instruments | 0.010 | 0.080 | 0.155 | 0.042 | 0.066 |
+| Video Games | 0.020 | 0.100 | 0.175 | 0.058 | 0.081 |
+| Office Products | 0.015 | 0.065 | 0.135 | 0.042 | 0.063 |
+| Home & Kitchen | 0.050 | 0.120 | 0.210 | 0.087 | 0.116 |
+| Sports & Outdoors | 0.005 | 0.065 | 0.145 | 0.037 | 0.062 |
+| Pet Supplies | 0.015 | 0.095 | 0.185 | 0.056 | 0.085 |
+| **Overall** | **0.022** | **0.085** | **0.170** | **0.053** | **0.081** |
+| Popularity baseline | 0.000 | 0.002 | 0.003 | 0.001 | 0.001 |
+
+RecGPT beats popularity by ~50× — it generates the right content sub-cluster
+from a user's history.
+
+**Ablation — one joint model vs one model per domain** (same shared codebook).
+A single joint RecGPT is competitive with, and often better than, specialized
+per-domain models — positive transfer through the shared Semantic ID space:
+
+| Domain | Joint R@10 | Specialized R@10 | Joint NDCG@10 | Specialized NDCG@10 |
+|---|---|---|---|---|
+| Musical Instruments | 0.155 | 0.145 | 0.066 | 0.069 |
+| Video Games | 0.175 | 0.160 | 0.081 | 0.062 |
+| Office Products | 0.135 | 0.175 | 0.063 | 0.070 |
+| Home & Kitchen | 0.210 | 0.150 | 0.116 | 0.070 |
+| Sports & Outdoors | 0.145 | 0.205 | 0.062 | 0.094 |
+| Pet Supplies | 0.185 | 0.160 | 0.085 | 0.068 |
+
 ## notebooks
 
-Two short, didactic notebooks (synthetic data, runs in seconds, no gated model
-needed) that open up the two core ideas:
+Two short, didactic notebooks (run in seconds, no gated model needed) that open
+up the two core ideas:
 
 - `notebooks/01_semantic_ids.ipynb` — train the RQ-VAE, watch the loss fall, and
   *see* that items sharing a first code occupy the same region of embedding space.
@@ -133,7 +196,9 @@ needed) that open up the two core ideas:
 | `tokenizer.py` | Semantic ID tuples ↔ transformer tokens |
 | `model.py` | `RecGPT`, a trimmed nanoGPT |
 | `train.py` | next-token training over Semantic ID sequences |
-| `eval.py` | constrained beam search → Recall@K / NDCG@K |
+| `eval.py` | constrained beam search → per-split Recall@K / NDCG@K |
+| `checkpoints.py` | one-line save / reload of the trained RQ-VAE and RecGPT |
+| `experiments.py` | reproduce the results: codebook + per-category + ablation |
 | `show_neighbors.py` | inspect items that share a Semantic ID prefix |
 | `run.sh` | run all five stages in order |
 
@@ -141,18 +206,25 @@ needed) that open up the two core ideas:
 
 All knobs live in `config.py`. The interesting ones:
 
-- `category` — any Amazon Reviews 2023 category.
+- `categories` — list of Amazon Reviews 2023 categories to pool (default: 3).
+- `k_core` — interaction-count threshold for users/items (default: 20).
 - `embed_dim` — Matryoshka size (128 / 256 / 512 / 768).
 - `rq_levels`, `rq_codebook_size` — Semantic ID length and resolution.
 - `n_layer`, `n_embd` — scale RecGPT up for bigger catalogs.
 
+Evaluation uses a **temporal split** (last item = test, second-to-last = val);
+the RQ-VAE keeps a held-out item split and reports codebook utilization so you
+can tell a healthy codebook from a collapsed one.
+
 ## todos
 
-This is the **base version**. Coming next:
+Done so far: loss curves + cluster visualization (notebooks), multi-domain
+catalog, temporal split, per-category Recall/NDCG, dead-code revival, joint-vs-
+specialized ablation. Coming next:
 
-- [ ] Plots: RQ-VAE reconstruction/commitment loss curves and RecGPT training loss.
-- [ ] Cluster visualization — show that prefix-shared Semantic IDs form coherent groups.
-- [ ] More datasets (multiple Amazon categories + MovieLens) and a results table.
+- [ ] Run the real EmbeddingGemma + Amazon pipeline end-to-end and report numbers.
+- [ ] Add a SASRec / item-id GPT baseline next to the Semantic ID model.
+- [ ] Trie-constrained beam search (only ever decode valid item IDs).
 
 ## acknowledgements
 
